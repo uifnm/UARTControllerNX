@@ -37,7 +37,7 @@
 #define JOYCON_L 0x01
 #define JOYCON_R 0x02
 
-#define CONTROLLER_TYPE JOYCON_L
+#define CONTROLLER_TYPE PRO_CON
 
 // Buttons and sticks
 #define A_DPAD_CENTER 0x08
@@ -62,36 +62,20 @@ static uint8_t cx_send = 128;
 static uint8_t cy_send = 128;
 
 SemaphoreHandle_t xSemaphore;
-SemaphoreHandle_t spiSemaphore;
+// SemaphoreHandle_t spiSemaphore;
 bool connected = false;
-int paired = 0;
+bool paired = false;
 TaskHandle_t ButtonsHandle = NULL;
 TaskHandle_t SendingHandle = NULL;
 TaskHandle_t BlinkHandle = NULL;
 static esp_hidd_app_param_t app_param;
 static esp_hidd_qos_param_t both_qos;
+
 // Timer has +1 added to it every send cycle
 // Apparently, it can be used to detect packet loss/excess latency
 uint8_t timer = 0;
 
-typedef enum {
-  SYNCED,
-  SYNC_START,
-  SYNC_1,
-  OUT_OF_SYNC,
-  CHOCO_SYNC_1,
-  CHOCO_SYNCED
-} State_t;
-
-typedef enum {
-  COMMAND_NOP = 0,
-  COMMAND_SYNC_1 = 0x33,
-  COMMAND_SYNC_2 = 0xCC,
-  COMMAND_SYNC_START = 0xFF,
-  COMMAND_CHOCO_SYNC_1 = 0x44,
-  COMMAND_CHOCO_SYNC_2 = 0xEE
-} Command_t;
-
+/*
 typedef enum {
   RESP_USB_ACK = 0x90,
   RESP_UPDATE_ACK = 0x91,
@@ -102,6 +86,7 @@ typedef enum {
   RESP_CHOCO_SYNC_1 = 0xEE,
   RESP_CHOCO_SYNC_OK = CONTROLLER_TYPE
 } Response_t;
+*/
 
 #define UART_TXD_PIN \
   (UART_PIN_NO_CHANGE)  // When UART2, TX GPIO_NUM_19, RX GPIO_NUM_26
@@ -110,455 +95,223 @@ typedef enum {
 #define UART_NUM (UART_NUM_0)
 
 uart_config_t uart_config;
-
 QueueHandle_t uart_queue;
-
 #define BUF_SIZE (256)
-
 uint8_t* uart_data;
 
-State_t uart_state = OUT_OF_SYNC;
-
-// https://www.microchip.com/webdoc/AVRLibcReferenceManual/group__util__crc_1gab27eaaef6d7fd096bd7d57bf3f9ba083.html
-uint8_t crc8_ccitt_update(uint8_t inCrc, uint8_t inData) {
-  uint8_t i;
-  uint8_t data;
-
-  data = inCrc ^ inData;
-
-  for (i = 0; i < 8; i++) {
-    if ((data & 0x80) != 0) {
-      data <<= 1;
-      data ^= 0x07;
-    } else {
-      data <<= 1;
-    }
-  }
-  return data;
-}
-
 void uart_init() {
-  uart_config.baud_rate = 19200;
+  uart_config.baud_rate = 9600;
+  // uart_config.baud_rate = 115200;
   uart_config.data_bits = UART_DATA_8_BITS;
   uart_config.parity = UART_PARITY_DISABLE;
   uart_config.stop_bits = UART_STOP_BITS_1;
   uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
 
   uart_param_config(UART_NUM, &uart_config);
-  uart_set_pin(UART_NUM, UART_TXD_PIN, UART_RXD_PIN, UART_PIN_NO_CHANGE,
-               UART_PIN_NO_CHANGE);
-  ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 10,
-                                      &uart_queue, 0));
+  uart_set_pin(UART_NUM, UART_TXD_PIN, UART_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 10, &uart_queue, 0));
 
   uart_data = (uint8_t*)malloc(BUF_SIZE);
 }
 
-// Send a byte over UART without echoing it to ESP LOG
-void send_byte_(uint8_t data) {
-  char buffer[2];
-  sprintf(buffer, "%c", data);
-  uart_write_bytes(UART_NUM, buffer, 1);
-}
-
-void send_byte(uint8_t data) {
-  send_byte_(data);
-  ESP_LOGI("uart out", "%X", data);
-}
-
 static void uart_task() {
-  ESP_LOGI("hi", "Hi from core %d!. uart_task\n", xPortGetCoreID());
-  // uart_flush(UART_NUM);
-  while (1) {
+  uint8_t stored_num = 0;
+  uint8_t stored_uart_data[11];
+  memset(stored_uart_data, 0, 11);
+
+  while (1)
+  {
+    ESP_LOGI("uart", "Recieving uart packets on core %d\n", xPortGetCoreID());
+  
     int len = uart_read_bytes(UART_NUM, uart_data, BUF_SIZE, portTICK_RATE_MS);
 
     if (len > 0) {
-      ESP_LOGI("uart in", "length: %d - %X", len, uart_data[0]);
-      // Packet length is supposed to be 9 bytes
-      // Sometimes, however, two packets can be combined due to the nature of
-      // uart_read_bytes. Theoretically, I could have my own ISR for UART
-      // recieving, but I'm choosing to keep it this way for simplicities sake.
-      // This may change in the future, but is currently unlikely.
-      if (len >= 9) {
-        // If we've already passed the handshake.
-        if (/*len == 9 && */
-            uart_state == SYNCED || uart_state == CHOCO_SYNCED) {
-          // Passing the actual packet data through a CRC8 check to make sure
-          // the recieved data isn't malformed.
-          uint8_t current_crc = 0;
-          for (uint8_t i = 0; i < 8; i++) {
-            current_crc = crc8_ccitt_update(current_crc, uart_data[i]);
-          }
-          // CRC check passed. Let's populate our data.
-          if (current_crc == uart_data[8]) {
-            // So... This is a big fork in the road between the original
-            // SwitchInputEmulator and mine here on the ESP32.
+      for(int i=0;i<len;i++)
+      {
+        if(stored_num == 11)
+        {
+          continue;
+        }
+        stored_uart_data[stored_num++] = uart_data[i];
+        if(stored_num == 11)
+        {
+          stored_num = 0;
 
-            // Normally, it would just send the values as is, but now with the
-            // original handshake (Master: FF 33 CC), it will go into what I am
-            // naming "Chocolate" mode. Where inputs are simplified and
-            // converted for sideways joycons (if it is set as a Joy-Con, that
-            // is.)
+          // if (CONTROLLER_TYPE == PRO_CON) {
+            // uart_data[0] &= ~(1 << 7);  // Clear SL
+            // uart_data[0] &= ~(1 << 6);  // Clear SR
+          // }
+          bool up_button = ((stored_uart_data[5] >> 3) & 1); // X
+          bool down_button = ((stored_uart_data[5] >> 1) & 1); // B
+          bool left_button = ((stored_uart_data[5] >> 0) & 1); // Y
+          bool right_button = ((stored_uart_data[5] >> 2) & 1); // A
 
-            // DPad, Left Stick, and Right Stick is all converted to the main
-            // stick for that controller. (Left stick for L Joy-Con and Pro Con,
-            // Right stick for R Joy-Con).
-            // As of writing, the order of importance is:
-            // DPad, L Stick, R Stick. If one of those is off center, the first
-            // one in that list is the one the stick is set off of.
+          bool start_button = 0;
+          //    ((uart_data[0] >> 1) & 1) || ((uart_data[0] >> 0) & 1);
 
-            // A B X Y is set to the proper side for the sideways joycon.
-            // Example: A is going to be Down on L JC, and X on R JC.
+          bool stickclick_button = 0;
+          //    ((uart_data[0] >> 3) & 1) || ((uart_data[0] >> 2) & 1);
 
-            // Shoulder buttons are simplified in this way:
-            // Sending either L, ZL, or SL, will press:
-            // L, ZL on Pro Con
-            // SL on Joy-Cons.
-            // Similar behavior is on the right side as well.
-            if (uart_state == CHOCO_SYNCED) {
-              // Vanilla mode, ahoy!
-              // This sets it exactly as it is given, with very little thought
-              // given to the input given.
+          bool left_shoulder = 0;
+          //                     ((uart_data[0] >> 6) & 1) ||
+          //                     ((uart_data[1] >> 4) & 1) ||
+          //                     ((uart_data[1] >> 6) & 1);
+          bool right_shoulder = 0;
+          //                     ((uart_data[0] >> 7) & 1) ||
+          //                     ((uart_data[1] >> 5) & 1) ||
+          //                     ((uart_data[1] >> 7) & 1);
 
-              // This is used to clear the 2 most significant bits in the first
-              // packet (which are mapped to SR and SL)
-              // Frankly, I'm unsure if this is *required*, but better safe than
-              // sorry when it comes to being sneaky about the true nature of
-              // the connected device.
-              if (CONTROLLER_TYPE == PRO_CON) {
-                uart_data[0] &= ~(1 << 7);  // Clear SL
-                uart_data[0] &= ~(1 << 6);  // Clear SR
-              }
+          bool home_button = 0; // ((uart_data[0] >> 4) & 1);
+          bool capture_button = 0; // ((uart_data[0] >> 5) & 1);
 
-              // Clearing shared data byte.
-              but2_send = 0;
+          uint8_t stickX = 128;
+          uint8_t stickY = 128;
+          if (stored_uart_data[7] != A_DPAD_CENTER) {
+            switch (stored_uart_data[7]) {
+              case A_DPAD_CENTER:
+                break;
+              case A_DPAD_U:
+                stickY = 255;
+                break;
+              case A_DPAD_R:
+                stickX = 255;
+                break;
+              case A_DPAD_D:
+                stickY = 0;
+                break;
+              case A_DPAD_L:
+                stickX = 0;
+                break;
+              case A_DPAD_U_R:
+                stickY = 255;
+                stickX = 255;
+                break;
+              case A_DPAD_U_L:
+                stickY = 255;
+                stickX = 0;
+                break;
+              case A_DPAD_D_R:
+                stickY = 0;
+                stickX = 255;
+                break;
+              case A_DPAD_D_L:
+                stickY = 0;
+                stickX = 0;
+                break;
 
-              if ((CONTROLLER_TYPE & JOYCON_R) == JOYCON_R) {
-                // If this is a right joycon or a procon.
-                but1_send = (((uart_data[1] >> 0) & 1) << 0) +   // Y
-                            (((uart_data[1] >> 3) & 1) << 1) +   // X
-                            (((uart_data[1] >> 1) & 1) << 2) +   // B
-                            (((uart_data[1] >> 2) & 1) << 3) +   // A
-                            (((uart_data[0] >> 7) & 1) << 4) +   // SR
-                            (((uart_data[0] >> 6) & 1) << 5) +   // SL
-                            (((uart_data[1] >> 5) & 1) << 6) +   // R
-                            (((uart_data[1] >> 7) & 1) << 7);    // ZR
-                but2_send += (((uart_data[0] >> 4) & 1) << 4) +  // Home
-                             (((uart_data[0] >> 1) & 1) << 1) +  // +/Start
-                             (((uart_data[0] >> 3) & 1) << 2);  // R Stick Click
-
-                cx_send = uart_data[5];
-                cy_send = 255 - uart_data[6];
-              }
-
-              if ((CONTROLLER_TYPE & JOYCON_L) == JOYCON_L) {
-                // If this is a left joycon or a procon.
-
-                // This is a bit of an ugly solution, but it's the first thing
-                // that came to mind.
-                bool dpad_d = false;
-                bool dpad_u = false;
-                bool dpad_r = false;
-                bool dpad_l = false;
-
-                switch (uart_data[2]) {
-                  case A_DPAD_CENTER:
-                    break;
-                  case A_DPAD_U:
-                    dpad_u = true;
-                    break;
-                  case A_DPAD_R:
-                    dpad_r = true;
-                    break;
-                  case A_DPAD_D:
-                    dpad_d = true;
-                    break;
-                  case A_DPAD_L:
-                    dpad_l = true;
-                    break;
-                  case A_DPAD_U_R:
-                    dpad_u = true;
-                    dpad_r = true;
-                    break;
-                  case A_DPAD_U_L:
-                    dpad_u = true;
-                    dpad_l = true;
-                    break;
-                  case A_DPAD_D_R:
-                    dpad_d = true;
-                    dpad_r = true;
-                    break;
-                  case A_DPAD_D_L:
-                    dpad_d = true;
-                    dpad_l = true;
-                    break;
-
-                  default:
-                    break;
-                }
-
-                but3_send = ((dpad_d) << 0) +                   // Down
-                            ((dpad_u) << 1) +                   // Up
-                            ((dpad_r) << 2) +                   // Right
-                            ((dpad_l) << 3) +                   // Left
-                            (((uart_data[0] >> 7) & 1) << 4) +  // SR
-                            (((uart_data[0] >> 6) & 1) << 5) +  // SL
-                            (((uart_data[1] >> 4) & 1) << 6) +  // L
-                            (((uart_data[1] >> 6) & 1) << 7);   // ZL
-
-                but2_send += (((uart_data[0] >> 5) & 1) << 5) +  // Capture
-                             (((uart_data[0] >> 0) & 1) << 0) +  // -/Select
-                             (((uart_data[0] >> 2) & 1) << 3);  // L Stick Click
-                lx_send = uart_data[3];
-                ly_send = 255 - uart_data[4];
-              }
-              // This is also commented out on the original SwitchInputEmulator,
-              // so I'm just referencing it as such. :)
-              // send_byte(RESP_UPDATE_ACK);
-            } else if (uart_state == SYNCED) {
-              // Chocolate mode ahoy.
-              // This does the simplification for all types of controllers.
-              if (CONTROLLER_TYPE == PRO_CON) {
-                // uart_data[0] &= ~(1 << 7);  // Clear SL
-                // uart_data[0] &= ~(1 << 6);  // Clear SR
-              }
-              bool up_button = ((uart_data[1] >> 3) & 1);
-              bool down_button = ((uart_data[1] >> 1) & 1);
-              bool left_button = ((uart_data[1] >> 0) & 1);
-              bool right_button = ((uart_data[1] >> 2) & 1);
-
-              bool start_button =
-                  ((uart_data[0] >> 1) & 1) || ((uart_data[0] >> 0) & 1);
-
-              bool stickclick_button =
-                  ((uart_data[0] >> 3) & 1) || ((uart_data[0] >> 2) & 1);
-
-              bool left_shoulder = ((uart_data[0] >> 6) & 1) ||
-                                   ((uart_data[1] >> 4) & 1) ||
-                                   ((uart_data[1] >> 6) & 1);
-              bool right_shoulder = ((uart_data[0] >> 7) & 1) ||
-                                    ((uart_data[1] >> 5) & 1) ||
-                                    ((uart_data[1] >> 7) & 1);
-
-              bool home_button = ((uart_data[0] >> 4) & 1);
-              bool capture_button = ((uart_data[0] >> 5) & 1);
-
-              uint8_t stickX = 128;
-              uint8_t stickY = 128;
-              if (uart_data[2] != A_DPAD_CENTER) {
-                switch (uart_data[2]) {
-                  case A_DPAD_CENTER:
-                    break;
-                  case A_DPAD_U:
-                    stickY = 255;
-                    break;
-                  case A_DPAD_R:
-                    stickX = 255;
-                    break;
-                  case A_DPAD_D:
-                    stickY = 0;
-                    break;
-                  case A_DPAD_L:
-                    stickX = 0;
-                    break;
-                  case A_DPAD_U_R:
-                    stickY = 255;
-                    stickX = 255;
-                    break;
-                  case A_DPAD_U_L:
-                    stickY = 255;
-                    stickX = 0;
-                    break;
-                  case A_DPAD_D_R:
-                    stickY = 0;
-                    stickX = 255;
-                    break;
-                  case A_DPAD_D_L:
-                    stickY = 0;
-                    stickX = 0;
-                    break;
-
-                  default:
-                    break;
-                }
-              } else {
-                if (uart_data[3] != 128 || uart_data[4] != 128) {
-                  stickX = uart_data[3];
-                  stickY = 255 - uart_data[4];
-                } else if (uart_data[5] != 128 || uart_data[6] != 128) {
-                  stickX = uart_data[5];
-                  stickY = 255 - uart_data[6];
-                }
-              }
-
-              // Clearing button bytes.
-              but1_send = 0;
-              but2_send = 0;
-              but3_send = 0;
-              if (CONTROLLER_TYPE == PRO_CON) {
-                // uart_data[0] &= ~(1 << 7);  // Clear SL
-                // uart_data[0] &= ~(1 << 6);  // Clear SR
-                lx_send = stickX;
-                ly_send = stickY;
-                cx_send = 128;
-                cy_send = 128;
-                but1_send = (left_button << 0) +     // Y
-                            (up_button << 1) +       // X
-                            (down_button << 2) +     // B
-                            (right_button << 3) +    // A
-                            (right_shoulder << 6) +  // R
-                            (right_shoulder << 7);   // ZR
-
-                but2_send += (home_button << 4) +        // Home
-                             (start_button << 1) +       // +/Start
-                             (stickclick_button << 3) +  // L Stick Click
-                             (capture_button << 5);
-
-                but3_send = (left_shoulder << 6) +  // L
-                            (left_shoulder << 7);   // ZL
-
-                //(select_button << 0) +  // -/Select
-                //(((uart_data[0] >> 2) & 1) << 3);  // L
-                // Stick Click
-              }
-              if (CONTROLLER_TYPE == JOYCON_R) {
-                // If this is a right joycon or a procon.
-
-                lx_send = 128;
-                ly_send = 128;
-                cx_send = 255 - stickY;
-                cy_send = stickX;
-
-                but1_send = (up_button << 0) +       // Y
-                            (right_button << 1) +    // X
-                            (left_button << 2) +     // B
-                            (down_button << 3) +     // A
-                            (right_shoulder << 4) +  // SR
-                            (left_shoulder << 5);    // SL
-
-                but2_send += (home_button << 4) +       // Home
-                             (start_button << 1) +      // +/Start
-                             (stickclick_button << 2);  // R Stick Click
-              }
-
-              if (CONTROLLER_TYPE == JOYCON_L) {
-                // If this is a left joycon or a procon.
-
-                lx_send = stickY;
-                ly_send = 255 - stickX;
-                cx_send = 128;
-                cy_send = 128;
-
-                but3_send = (right_button << 0) +    // Y
-                            (left_button << 1) +     // X
-                            (up_button << 2) +       // B
-                            (down_button << 3) +     // A
-                            (right_shoulder << 4) +  // SR
-                            (left_shoulder << 5);    // SL
-
-                but2_send += (start_button << 0) +       // -/Select
-                             (stickclick_button << 3) +  // L Stick Click
-                             (capture_button << 5);      // Capture
-              }
-              // send_byte(RESP_UPDATE_ACK);
+              default:
+                break;
             }
-
-          } else if (uart_data[8] == COMMAND_SYNC_START) {
-            // If CRC check didn't pass, but the suggested checksum is 0xFF,
-            // assume that the master is trying to force a resync.
-            uart_state = SYNC_START;
-            send_byte(RESP_SYNC_START);
-            continue;
-          } else {
-            // If CRC didn't pass, but wasn't 0xFF, keep assuming we want to be
-            // handshook, tell the master that we didn't update, and continue
-            // on.
-            send_byte(RESP_UPDATE_NACK);
-            ESP_LOGI(
-                "CRC Error",
-                "Packet specified CRC 0x%02x but calculated CRC was 0x%02x",
-                uart_data[8], current_crc);
-            ESP_LOGI(
-                "CRC Error",
-                "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                uart_data[0], uart_data[1], uart_data[2], uart_data[3],
-                uart_data[4], uart_data[5], uart_data[6], uart_data[7],
-                uart_data[8]);
           }
-        }
-      }
-      // Initial, vanilla handshake.
-      // MASTER: 0xFF
-      // SLAVE: 0xFF
-      // MASTER: 0x33
-      // SLAVE: 0xCC
-      // MASTER: 0xCC
-      // SLAVE: 0x33, then 0x90 with each packet sent as an HID
+          /* else {
+            if (uart_data[3] != 128 || uart_data[4] != 128) {
+              stickX = uart_data[3];
+              stickY = 255 - uart_data[4];
+            } else if (uart_data[5] != 128 || uart_data[6] != 128) {
+              stickX = uart_data[5];
+              stickY = 255 - uart_data[6];
+            }
+          }*/
 
-      // Planning on having another handshake mode for easy JoyCon usage.
-      // As in, DPad/L Stick/R Stick will update the proper stick accordingly,
-      // and in the direction as if it's sideways.
-      // And ABXY will be the proper positioning if sideways. But if this
-      // handshake is done while emulating a Pro Controller, the current thought
-      // is to use the DPad, ABXY, and L/R shoulder buttons
-      // (maybe both sets of LR/ZLZR like the NullWiiCon?)
+          // Clearing button bytes.
+          but1_send = 0;
+          but2_send = 0;
+          but3_send = 0;
+          if (CONTROLLER_TYPE == PRO_CON) {
+            // uart_data[0] &= ~(1 << 7);  // Clear SL
+            // uart_data[0] &= ~(1 << 6);  // Clear SR
+            lx_send = stickX;
+            ly_send = stickY;
+            cx_send = 128;
+            cy_send = 128;
+            but1_send = (left_button << 0) +     // Y
+                        (up_button << 1) +       // X
+                        (down_button << 2) +     // B
+                        (right_button << 3) +    // A
+                        (right_shoulder << 6) +  // R
+                        (right_shoulder << 7);   // ZR
 
-      // "Chocolate" handshake.
-      // MASTER: 0xFF
-      // SLAVE: 0xFF
-      // MASTER: 0x44
-      // SLAVE: 0xEE
-      // MASTER: 0xEE
-      // SLAVE: CONTROLLER_TYPE, then 0x90 with each packet sent as an HID
-      if (uart_state == SYNC_START) {
-        if (uart_data[0] == COMMAND_SYNC_1) {
-          uart_state = SYNC_1;
-          send_byte(RESP_SYNC_1);
-        } else if (uart_data[0] == COMMAND_CHOCO_SYNC_1) {
-          uart_state = CHOCO_SYNC_1;
-          send_byte(RESP_CHOCO_SYNC_1);
-        } else {
-          uart_state = OUT_OF_SYNC;
-        }
-      } else if (uart_state == SYNC_1) {
-        if (uart_data[0] == COMMAND_SYNC_2) {
-          uart_state = SYNCED;
-          send_byte(RESP_SYNC_OK);
-        } else {
-          uart_state = OUT_OF_SYNC;
-        }
-      } else if (uart_state == CHOCO_SYNC_1) {
-        if (uart_data[0] == COMMAND_CHOCO_SYNC_2) {
-          // ESP_LOGI("BBBBBBBBBBBB", "BBBBBBBBBB");
-          uart_state = CHOCO_SYNCED;
-          send_byte(RESP_CHOCO_SYNC_OK);
-        } else {
-          uart_state = OUT_OF_SYNC;
+            but2_send += (home_button << 4) +        // Home
+                          (start_button << 1) +       // +/Start
+                          (stickclick_button << 3) +  // L Stick Click
+                          (capture_button << 5);
+
+            but3_send = (left_shoulder << 6) +  // L
+                        (left_shoulder << 7);   // ZL
+
+            //(select_button << 0) +  // -/Select
+            //(((uart_data[0] >> 2) & 1) << 3);  // L
+            // Stick Click
+          }
+          if (CONTROLLER_TYPE == JOYCON_R) {
+            // If this is a right joycon or a procon.
+
+            lx_send = 128;
+            ly_send = 128;
+            cx_send = 255 - stickY;
+            cy_send = stickX;
+
+            but1_send = (up_button << 0) +       // Y
+                        (right_button << 1) +    // X
+                        (left_button << 2) +     // B
+                        (down_button << 3) +     // A
+                        (right_shoulder << 4) +  // SR
+                        (left_shoulder << 5);    // SL
+
+            but2_send += (home_button << 4) +       // Home
+                          (start_button << 1) +      // +/Start
+                          (stickclick_button << 2);  // R Stick Click
+          }
+
+          if (CONTROLLER_TYPE == JOYCON_L) {
+            // If this is a left joycon or a procon.
+
+            lx_send = stickY;
+            ly_send = 255 - stickX;
+            cx_send = 128;
+            cy_send = 128;
+
+            but3_send = (right_button << 0) +    // Y
+                        (left_button << 1) +     // X
+                        (up_button << 2) +       // B
+                        (down_button << 3) +     // A
+                        (right_shoulder << 4) +  // SR
+                        (left_shoulder << 5);    // SL
+
+            but2_send += (start_button << 0) +       // -/Select
+                          (stickclick_button << 3) +  // L Stick Click
+                          (capture_button << 5);      // Capture
+          }
+          // send_byte(RESP_UPDATE_ACK);
+
+          ESP_LOGI(
+            "uart",
+            "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            stored_uart_data[0], stored_uart_data[1], stored_uart_data[2], stored_uart_data[3],
+            stored_uart_data[4], stored_uart_data[5], stored_uart_data[6], stored_uart_data[7],
+            stored_uart_data[8], stored_uart_data[9], stored_uart_data[10]);
+
         }
       }
-      if (uart_state == OUT_OF_SYNC) {
-        if (uart_data[0] == COMMAND_SYNC_START) {
-          uart_state = SYNC_START;
-          send_byte(RESP_SYNC_START);
-        }
-      }
-    }
-    // char buffer[10];ste
-    // sprintf(buffer, "l:%d", len);
-    // uart_write_bytes(UART_NUM, buffer, 10);
-    vTaskDelay(15);
+
+    // vTaskDelay(15);
+
     if (but1_send || but2_send || but3_send)
-      ESP_LOGI("debug", "but1: %d, but2: %d, but3: %d\n", but1_send, but2_send,
-               but3_send);
+    {
+      ESP_LOGI("uart", "but1: %d, but2: %d, but3: %d\n", but1_send, but2_send, but3_send);
+    }
 
     if ((lx_send != 128 && lx_send != 127) ||
         (ly_send != 128 && ly_send != 127) ||
         (cx_send != 128 && cx_send != 127) ||
         (cy_send != 128 && cy_send != 127))
-      ESP_LOGI("debug", "lx: %d, ly: %d, cx: %d, cy: %d\n", lx_send, ly_send,
-               cx_send, cy_send);
+      {
+        ESP_LOGI("uart", "lx: %d, ly: %d, cx: %d, cy: %d\n", lx_send, ly_send, cx_send, cy_send);
+      }
+    }
   }
-  // ESP_LOGI("SNES", "but1: %d, but2: %d, but3: %d, upper: %d, lower: %d\n",
-  //          but1_send, but2_send, but3_send, upper, lower);
+
+  vTaskDelete(NULL);
 }
 
 // Switch button report example //         batlvl       Buttons Lstick Rstick
@@ -593,21 +346,15 @@ void send_buttons() {
   timer += 1;
   if (timer == 255) timer = 0;
 
-  if ((uart_state == SYNCED || uart_state == CHOCO_SYNCED) &&
-      (paired || connected)) {
-    // ESP_LOGI("AAAAAAAA", "AAAAAA");
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                               sizeof(report30), report30);
-    send_byte_(RESP_USB_ACK);
+  if (paired || connected)
+  {
+    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30, sizeof(report30), report30);
     vTaskDelay(15);
-  } else {
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                               sizeof(dummy), dummy);
-    vTaskDelay(100);
   }
-
-  if (!paired || !(uart_state == SYNCED || uart_state == CHOCO_SYNCED)) {
-  } else {
+  else
+  {
+    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30, sizeof(dummy), dummy);
+    vTaskDelay(100);
   }
 }
 
@@ -625,11 +372,10 @@ static uint8_t reply02[] = {
     // 03 - Pro Controller
     0x02, 0xD4, 0xF0, 0x57, 0x6E, 0xF0, 0xD7, 0x01,
 #if CONTROLLER_TYPE == PRO_CON
-    0x02
+    0x02,
 #else
-    0x01
+    0x01,
 #endif
-    ,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -847,14 +593,14 @@ void set_bt_address()
         if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
 
         if (addr_size > 0) {
-                err = nvs_get_blob(my_handle, "mac_addr", bt_addr, &addr_size);
+          err = nvs_get_blob(my_handle, "mac_addr", bt_addr, &addr_size);
         }
         else
         {
-                for(int i=0; i<8; i++)
-                        bt_addr[i] = esp_random()%255;
-                size_t addr_size = sizeof(bt_addr);
-                err = nvs_set_blob(my_handle, "mac_addr", bt_addr, addr_size);
+          for(int i=0; i<8; i++)
+            bt_addr[i] = esp_random()%255;
+          size_t addr_size = sizeof(bt_addr);
+          err = nvs_set_blob(my_handle, "mac_addr", bt_addr, addr_size);
         }
 
         err = nvs_commit(my_handle);
@@ -863,7 +609,7 @@ void set_bt_address()
 
         //put mac addr in switch pairing packet
         for(int z=0; z<6; z++)
-                reply02[z+19] = bt_addr[z];
+          reply02[z+19] = bt_addr[z];
 }
 void print_bt_address() {
         const char* TAG = "bt_address";
@@ -877,273 +623,274 @@ void print_bt_address() {
 #define SPP_TAG "tag"
 static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
-        switch(event) {
-        case ESP_BT_GAP_DISC_RES_EVT:
-                ESP_LOGI(SPP_TAG, "ESP_BT_GAP_DISC_RES_EVT");
-                esp_log_buffer_hex(SPP_TAG, param->disc_res.bda, ESP_BD_ADDR_LEN);
-                break;
-        case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
-                ESP_LOGI(SPP_TAG, "ESP_BT_GAP_DISC_STATE_CHANGED_EVT");
-                break;
-        case ESP_BT_GAP_RMT_SRVCS_EVT:
-                ESP_LOGI(SPP_TAG, "ESP_BT_GAP_RMT_SRVCS_EVT");
-                ESP_LOGI(SPP_TAG, "%d", param->rmt_srvcs.num_uuids);
-                break;
-        case ESP_BT_GAP_RMT_SRVC_REC_EVT:
-                ESP_LOGI(SPP_TAG, "ESP_BT_GAP_RMT_SRVC_REC_EVT");
-                break;
-        case ESP_BT_GAP_AUTH_CMPL_EVT: {
-                if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-                        ESP_LOGI(SPP_TAG, "authentication success: %s", param->auth_cmpl.device_name);
-                        esp_log_buffer_hex(SPP_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
-                } else {
-                        ESP_LOGE(SPP_TAG, "authentication failed, status:%d", param->auth_cmpl.stat);
-                }
-                break;
-        }
-
-        default:
-                break;
-        }
+  switch(event) {
+  case ESP_BT_GAP_DISC_RES_EVT:
+    ESP_LOGI(SPP_TAG, "ESP_BT_GAP_DISC_RES_EVT");
+    esp_log_buffer_hex(SPP_TAG, param->disc_res.bda, ESP_BD_ADDR_LEN);
+    break;
+  case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+    ESP_LOGI(SPP_TAG, "ESP_BT_GAP_DISC_STATE_CHANGED_EVT");
+    break;
+  case ESP_BT_GAP_RMT_SRVCS_EVT:
+    ESP_LOGI(SPP_TAG, "ESP_BT_GAP_RMT_SRVCS_EVT");
+    ESP_LOGI(SPP_TAG, "%d", param->rmt_srvcs.num_uuids);
+    break;
+  case ESP_BT_GAP_RMT_SRVC_REC_EVT:
+    ESP_LOGI(SPP_TAG, "ESP_BT_GAP_RMT_SRVC_REC_EVT");
+    break;
+  case ESP_BT_GAP_AUTH_CMPL_EVT:
+    if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+      ESP_LOGI(SPP_TAG, "authentication success: %s", param->auth_cmpl.device_name);
+      esp_log_buffer_hex(SPP_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
+    } else {
+      ESP_LOGE(SPP_TAG, "authentication failed, status:%d", param->auth_cmpl.stat);
+    }
+    break;
+  default:
+    break;
+  }
 }
 
 void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
 {
-    static const char* TAG = "esp_bt_hidd_cb";
-    switch (event) {
-    case ESP_HIDD_INIT_EVT:
-            if (param->init.status == ESP_HIDD_SUCCESS) {
-                    ESP_LOGI(TAG, "setting hid parameters");
-                    esp_bt_hid_device_register_app(&app_param, &both_qos, &both_qos);
-            } else {
-                    ESP_LOGE(TAG, "init hidd failed!");
-            }
-            break;
-    case ESP_HIDD_DEINIT_EVT:
-            break;
-    case ESP_HIDD_REGISTER_APP_EVT:
-            if (param->register_app.status == ESP_HIDD_SUCCESS) {
-                    ESP_LOGI(TAG, "setting hid parameters success!");
-                    ESP_LOGI(TAG, "setting to connectable, discoverable");
-                    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-                    if (param->register_app.in_use && param->register_app.bd_addr != NULL) {
-                            ESP_LOGI(TAG, "start virtual cable plug!");
-                            esp_bt_hid_device_connect(param->register_app.bd_addr);
-                    }
-            } else {
-                    ESP_LOGE(TAG, "setting hid parameters failed!");
-            }
-            break;
-    case ESP_HIDD_UNREGISTER_APP_EVT:
-            if (param->unregister_app.status == ESP_HIDD_SUCCESS) {
-                    ESP_LOGI(TAG, "unregister app success!");
-            } else {
-                    ESP_LOGE(TAG, "unregister app failed!");
-            }
-            break;
-    case ESP_HIDD_OPEN_EVT:
-            if (param->open.status == ESP_HIDD_SUCCESS) {
-                    if (param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTING) {
-                            ESP_LOGI(TAG, "connecting...");
-                    } else if (param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTED) {
-                            ESP_LOGI(TAG, "connected to %02x:%02x:%02x:%02x:%02x:%02x", param->open.bd_addr[0],
-                                     param->open.bd_addr[1], param->open.bd_addr[2], param->open.bd_addr[3], param->open.bd_addr[4],
-                                     param->open.bd_addr[5]);
-                            ESP_LOGI(TAG, "making self non-discoverable and non-connectable.");
-                            esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-                            //clear blinking LED - solid
-                            //vTaskDelete(BlinkHandle);
-                            //BlinkHandle = NULL;
-                            //gpio_set_level(LED_GPIO, 1);
-                            //start solid
-                            xSemaphoreTake(xSemaphore, portMAX_DELAY);
-                            connected = true;
-                            xSemaphoreGive(xSemaphore);
-                            //restart send_task
-                            if(SendingHandle != NULL)
-                            {
-                                    vTaskDelete(SendingHandle);
-                                    SendingHandle = NULL;
-                            }
-                            xTaskCreatePinnedToCore(send_task, "send_task", 4096, NULL, 2, &SendingHandle, 0);
-                    } else {
-                            ESP_LOGE(TAG, "unknown connection status");
-                    }
-            } else {
-                    ESP_LOGE(TAG, "open failed!");
-            }
-            break;
-    case ESP_HIDD_CLOSE_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_CLOSE_EVT");
-            if (param->close.status == ESP_HIDD_SUCCESS) {
-                    if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTING) {
-                            ESP_LOGI(TAG, "disconnecting...");
-                    } else if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED) {
-                            ESP_LOGI(TAG, "disconnected!");
-                            ESP_LOGI(TAG, "making self discoverable and connectable again.");
-                            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-                            //xTaskCreate(startBlink, "blink_task", 1024, NULL, 1, &BlinkHandle);
-                            //start blink
-                            xSemaphoreTake(xSemaphore, portMAX_DELAY);
-                            connected = false;
-                            xSemaphoreGive(xSemaphore);
-                    } else {
-                            ESP_LOGE(TAG, "unknown connection status");
-                    }
-            } else {
-                    ESP_LOGE(TAG, "close failed!");
-            }
-            break;
-    case ESP_HIDD_SEND_REPORT_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_SEND_REPORT_EVT id:0x%02x, type:%d", param->send_report.report_id,
-                     param->send_report.report_type);
-            break;
-    case ESP_HIDD_REPORT_ERR_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_REPORT_ERR_EVT");
-            break;
-    case ESP_HIDD_GET_REPORT_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_GET_REPORT_EVT id:0x%02x, type:%d, size:%d", param->get_report.report_id,
-                     param->get_report.report_type, param->get_report.buffer_size);
-            break;
-    case ESP_HIDD_SET_REPORT_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_SET_REPORT_EVT");
-            break;
-    case ESP_HIDD_SET_PROTOCOL_EVT:
-            ESP_LOGI(TAG, "ESP_HIDD_SET_PROTOCOL_EVT");
-            if (param->set_protocol.protocol_mode == ESP_HIDD_BOOT_MODE) {
-                    ESP_LOGI(TAG, "  - boot protocol");
-            } else if (param->set_protocol.protocol_mode == ESP_HIDD_REPORT_MODE) {
-                    ESP_LOGI(TAG, "  - report protocol");
-            }
-            break;
-    case ESP_HIDD_INTR_DATA_EVT:
-        ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
-        esp_log_buffer_hex(TAG, param->intr_data.data, param->intr_data.len);
-        if (param->intr_data.data[9] == 2) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply02), reply02);
-          ESP_LOGI(TAG, "reply02");
-        }
-        if (param->intr_data.data[9] == 8) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply08), reply08);
-          ESP_LOGI(TAG, "reply08");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 0 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0),
-                                     spi_reply_address_0);
-          ESP_LOGI(TAG, "replyspi0");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 80 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x50),
-                                     spi_reply_address_0x50);
-          ESP_LOGI(TAG, "replyspi50");
-        }
-        if (param->intr_data.data[9] == 3) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply03), reply03);
-          ESP_LOGI(TAG, "reply03");
-        }
-        if (param->intr_data.data[9] == 4) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply04), reply04);
-          ESP_LOGI(TAG, "reply04");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 128 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x80),
-                                     spi_reply_address_0x80);
-          ESP_LOGI(TAG, "replyspi80");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 152 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x98),
-                                     spi_reply_address_0x98);
-          ESP_LOGI(TAG, "replyspi98");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 16 && param->intr_data.data[11] == 128) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x10),
-                                     spi_reply_address_0x10);
-          ESP_LOGI(TAG, "replyspi10");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 61 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x3d),
-                                     spi_reply_address_0x3d);
-          ESP_LOGI(TAG, "reply3d");
-        }
-        if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 32 && param->intr_data.data[11] == 96) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(spi_reply_address_0x20),
-                                     spi_reply_address_0x20);
-          ESP_LOGI(TAG, "replyspi20");
-        }
-        if (param->intr_data.data[9] == 64 /*&& param->intr_data.data[11] == 1*/) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply4001), reply4001);
-          ESP_LOGI(TAG, "reply4001");
-        }
-        if (param->intr_data.data[9] == 72 /* && param->intr_data.data[11] == 1*/) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply4801), reply4801);
-          ESP_LOGI(TAG, "reply4801");
-        }
-        if (param->intr_data.data[9] == 34 /*&& param->intr_data.data[11] == 1*/) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply3401), reply3401);
-          ESP_LOGI(TAG, "reply3401");
-        }
-        if (param->intr_data.data[9] == 48 /*&& param->intr_data.data[11] == 1*/) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply3001), reply3001);
-          ESP_LOGI(TAG, "reply3001");
-          if (CONTROLLER_TYPE == JOYCON_L) {
-            paired = 1;
-          }
-        }
-    
-        if (param->intr_data.data[9] == 33 && param->intr_data.data[10] == 33) {
-          esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
-                                     sizeof(reply3333), reply3333);
-          ESP_LOGI(TAG, "reply3333");
-          paired = 1;
-        }
-        break;
-    case ESP_HIDD_VC_UNPLUG_EVT:
-                ESP_LOGI(TAG, "ESP_HIDD_VC_UNPLUG_EVT");
-                if (param->vc_unplug.status == ESP_HIDD_SUCCESS) {
-                        if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED) {
-                                ESP_LOGI(TAG, "disconnected!");
-
-                                ESP_LOGI(TAG, "making self discoverable and connectable again.");
-                                esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-                        } else {
-                                ESP_LOGE(TAG, "unknown connection status");
-                        }
-                } else {
-                        ESP_LOGE(TAG, "close failed!");
-                }
-        break;
-    default:
-        break;
+  static const char* TAG = "esp_bt_hidd_cb";
+  switch (event) {
+  case ESP_HIDD_INIT_EVT:
+    if (param->init.status == ESP_HIDD_SUCCESS) {
+      ESP_LOGI(TAG, "setting hid parameters");
+      esp_bt_hid_device_register_app(&app_param, &both_qos, &both_qos);
+    } else {
+      ESP_LOGE(TAG, "init hidd failed!");
     }
+    break;
+  case ESP_HIDD_DEINIT_EVT:
+    break;
+  case ESP_HIDD_REGISTER_APP_EVT:
+    if (param->register_app.status == ESP_HIDD_SUCCESS) {
+      ESP_LOGI(TAG, "setting hid parameters success!");
+      ESP_LOGI(TAG, "setting to connectable, discoverable");
+      esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+      if (param->register_app.in_use && param->register_app.bd_addr != NULL) {
+        ESP_LOGI(TAG, "start virtual cable plug!");
+        esp_bt_hid_device_connect(param->register_app.bd_addr);
+      }
+    } else {
+      ESP_LOGE(TAG, "setting hid parameters failed!");
+    }
+    break;
+  case ESP_HIDD_UNREGISTER_APP_EVT:
+    if (param->unregister_app.status == ESP_HIDD_SUCCESS) {
+      ESP_LOGI(TAG, "unregister app success!");
+    } else {
+      ESP_LOGE(TAG, "unregister app failed!");
+    }
+    break;
+  case ESP_HIDD_OPEN_EVT:
+    if (param->open.status == ESP_HIDD_SUCCESS) {
+      if (param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTING) {
+        ESP_LOGI(TAG, "connecting...");
+      } else if (param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTED) {
+        ESP_LOGI(TAG, "connected to %02x:%02x:%02x:%02x:%02x:%02x", param->open.bd_addr[0],
+          param->open.bd_addr[1], param->open.bd_addr[2], param->open.bd_addr[3], param->open.bd_addr[4],
+          param->open.bd_addr[5]);
+        ESP_LOGI(TAG, "making self non-discoverable and non-connectable.");
+        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        //clear blinking LED - solid
+        //vTaskDelete(BlinkHandle);
+        //BlinkHandle = NULL;
+        //gpio_set_level(LED_GPIO, 1);
+        //start solid
+        xSemaphoreTake(xSemaphore, portMAX_DELAY);
+        connected = true;
+        xSemaphoreGive(xSemaphore);
+        //restart send_task
+        if(SendingHandle != NULL)
+        {
+          vTaskDelete(SendingHandle);
+          SendingHandle = NULL;
+        }
+        xTaskCreatePinnedToCore(send_task, "send_task", 4096, NULL, 2, &SendingHandle, 0);
+      } else {
+          ESP_LOGE(TAG, "unknown connection status");
+      }
+    } else {
+      ESP_LOGE(TAG, "open failed!");
+    }
+    break;
+  case ESP_HIDD_CLOSE_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_CLOSE_EVT");
+    if (param->close.status == ESP_HIDD_SUCCESS) {
+      if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTING) {
+        ESP_LOGI(TAG, "disconnecting...");
+      } else if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED) {
+        ESP_LOGI(TAG, "disconnected!");
+        ESP_LOGI(TAG, "making self discoverable and connectable again.");
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+        //xTaskCreate(startBlink, "blink_task", 1024, NULL, 1, &BlinkHandle);
+        //start blink
+        xSemaphoreTake(xSemaphore, portMAX_DELAY);
+        connected = false;
+        xSemaphoreGive(xSemaphore);
+      } else {
+        ESP_LOGE(TAG, "unknown connection status");
+      }
+    } else {
+      ESP_LOGE(TAG, "close failed!");
+    }
+    break;
+  case ESP_HIDD_SEND_REPORT_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_SEND_REPORT_EVT id:0x%02x, type:%d", param->send_report.report_id,
+      param->send_report.report_type);
+    break;
+  case ESP_HIDD_REPORT_ERR_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_REPORT_ERR_EVT");
+    break;
+  case ESP_HIDD_GET_REPORT_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_GET_REPORT_EVT id:0x%02x, type:%d, size:%d", param->get_report.report_id,
+      param->get_report.report_type, param->get_report.buffer_size);
+    break;
+  case ESP_HIDD_SET_REPORT_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_SET_REPORT_EVT");
+    break;
+  case ESP_HIDD_SET_PROTOCOL_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_SET_PROTOCOL_EVT");
+    if (param->set_protocol.protocol_mode == ESP_HIDD_BOOT_MODE) {
+      ESP_LOGI(TAG, "  - boot protocol");
+    } else if (param->set_protocol.protocol_mode == ESP_HIDD_REPORT_MODE) {
+      ESP_LOGI(TAG, "  - report protocol");
+    }
+    break;
+  case ESP_HIDD_INTR_DATA_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
+    esp_log_buffer_hex(TAG, param->intr_data.data, param->intr_data.len);
+    if (param->intr_data.data[9] == 2) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply02), reply02);
+      ESP_LOGI(TAG, "reply02");
+    }
+    if (param->intr_data.data[9] == 8) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply08), reply08);
+      ESP_LOGI(TAG, "reply08");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 0 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0),
+                                  spi_reply_address_0);
+      ESP_LOGI(TAG, "replyspi0");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 80 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x50),
+                                  spi_reply_address_0x50);
+      ESP_LOGI(TAG, "replyspi50");
+    }
+    if (param->intr_data.data[9] == 3) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply03), reply03);
+      ESP_LOGI(TAG, "reply03");
+    }
+    if (param->intr_data.data[9] == 4) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply04), reply04);
+      ESP_LOGI(TAG, "reply04");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 128 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x80),
+                                  spi_reply_address_0x80);
+      ESP_LOGI(TAG, "replyspi80");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 152 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x98),
+                                  spi_reply_address_0x98);
+      ESP_LOGI(TAG, "replyspi98");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 16 && param->intr_data.data[11] == 128) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x10),
+                                  spi_reply_address_0x10);
+      ESP_LOGI(TAG, "replyspi10");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 61 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x3d),
+                                  spi_reply_address_0x3d);
+      ESP_LOGI(TAG, "reply3d");
+    }
+    if (param->intr_data.data[9] == 16 && param->intr_data.data[10] == 32 && param->intr_data.data[11] == 96) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(spi_reply_address_0x20),
+                                  spi_reply_address_0x20);
+      ESP_LOGI(TAG, "replyspi20");
+    }
+    if (param->intr_data.data[9] == 64 /*&& param->intr_data.data[11] == 1*/) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply4001), reply4001);
+      ESP_LOGI(TAG, "reply4001");
+    }
+    if (param->intr_data.data[9] == 72 /* && param->intr_data.data[11] == 1*/) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply4801), reply4801);
+      ESP_LOGI(TAG, "reply4801");
+    }
+    if (param->intr_data.data[9] == 34 /*&& param->intr_data.data[11] == 1*/) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply3401), reply3401);
+      ESP_LOGI(TAG, "reply3401");
+    }
+    if (param->intr_data.data[9] == 48 /*&& param->intr_data.data[11] == 1*/) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply3001), reply3001);
+      ESP_LOGI(TAG, "reply3001");
+      if (CONTROLLER_TYPE == JOYCON_L) {
+        paired = true;
+      }
+    }
+    if (param->intr_data.data[9] == 33 && param->intr_data.data[10] == 33) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21,
+                                  sizeof(reply3333), reply3333);
+      ESP_LOGI(TAG, "reply3333");
+      paired = true;
+    }
+    break;
+  case ESP_HIDD_VC_UNPLUG_EVT:
+    ESP_LOGI(TAG, "ESP_HIDD_VC_UNPLUG_EVT");
+    if (param->vc_unplug.status == ESP_HIDD_SUCCESS) {
+      if (param->close.conn_status == ESP_HIDD_CONN_STATE_DISCONNECTED) {
+        ESP_LOGI(TAG, "disconnected!");
+
+        ESP_LOGI(TAG, "making self discoverable and connectable again.");
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+      } else {
+        ESP_LOGE(TAG, "unknown connection status");
+      }
+    } else {
+      ESP_LOGE(TAG, "close failed!");
+    }
+    break;
+  default:
+      break;
+  }
 }
 
-void app_main() {
-  // SNES Contoller reading init
-  // spi_init();
-  // xTaskCreatePinnedToCore(get_buttons, "gbuttons", 2048, NULL, 1,
-  //                         &ButtonsHandle, 1);
+void app_main()
+{
+  esp_log_level_set("*", ESP_LOG_ERROR);
+  // esp_log_level_set("*", ESP_LOG_WARN);
+  // esp_log_level_set("*", ESP_LOG_INFO);
+  
+  // esp_log_level_set("uart", ESP_LOG_INFO);
+
   if (CONTROLLER_TYPE != PRO_CON) {
     //report30[2] += (0x3 << 1);
     //dummy[2] += (0x3 << 1);
   }
+
   uart_init();
-  xTaskCreatePinnedToCore(uart_task, "uart_task", 2048, NULL, 1, &ButtonsHandle,
-                          1);
+  xTaskCreatePinnedToCore(uart_task, "uart_task", 2048, NULL, 1, &ButtonsHandle, 1);
+
   // flash LED
   vTaskDelay(100);
   gpio_set_level(LED_GPIO, 0);
@@ -1174,7 +921,6 @@ void app_main() {
   app_param.name = "Wireless Gamepad";
   app_param.description = "Gamepad";
   app_param.provider = "Nintendo";
-  // app_param.subclass = 0x002508;
   app_param.subclass = 0x8;
   app_param.desc_list = hid_descriptor;
   app_param.desc_list_len = hid_descriptor_len;
@@ -1241,4 +987,3 @@ void app_main() {
   // start blinking
   xTaskCreate(startBlink, "blink_task", 1024, NULL, 2, &BlinkHandle);
 }
-//

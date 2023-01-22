@@ -1,22 +1,27 @@
 {
     "configurations": [
         {
-            "name": "Linux",
+            "name": "Win32",
             "includePath": [
-                "/home/tony/esp/**",
-                "${workspaceRoot}"
+                "${config:idf.espIdfPath}/components/**",
+                "${workspaceFolder}/**"
             ],
             "browse": {
-                "limitSymbolsToIncludedHeaders": false,
                 "path": [
-                    "/home/tony/esp/**",
-                    "${workspaceRoot}"
-                ]
+                    "${config:idf.espIdfPath}/components"
+                ],
+                "limitSymbolsToIncludedHeaders": false
             },
-            "intelliSenseMode": "clang-x64",
-            "compilerPath": "/usr/bin/clang",
-            "cStandard": "c11",
-            "cppStandard": "c++14"
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-gcc-x86",
+            "configurationProvider": "ms-vscode.cpptools",
+            "compilerPath": "C:\\Espressif\\tools\\xtensa-esp32-elf\\esp-2021r2-patch5-8.4.0\\xtensa-esp32-elf\\bin\\xtensa-esp32-elf-gcc.exe"
         }
     ],
     "version": 4

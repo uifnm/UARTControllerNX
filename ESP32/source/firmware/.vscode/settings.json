@@ -18,7 +18,13 @@
         "sstream": "c",
         "streambuf": "c",
         "stop_token": "c",
-        "condition_variable": "c"
+        "condition_variable": "c",
+        "portmacro.h": "c",
+        "freertos.h": "c",
+        "esp_bt_device.h": "c"
     },
-    "C_Cpp.errorSquiggles": "Enabled"
+    "C_Cpp.errorSquiggles": "disabled",
+    "idf.adapterTargetName": "esp32",
+    "idf.portWin": "COM10",
+    "idf.flashType": "UART"
 }
