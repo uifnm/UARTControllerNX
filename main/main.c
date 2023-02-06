@@ -62,7 +62,7 @@ static uint8_t cx_send = 128;
 static uint8_t cy_send = 128;
 
 SemaphoreHandle_t xSemaphore;
-// SemaphoreHandle_t spiSemaphore;
+
 bool connected = false;
 bool paired = false;
 TaskHandle_t ButtonsHandle = NULL;
@@ -74,19 +74,6 @@ static esp_hidd_qos_param_t both_qos;
 // Timer has +1 added to it every send cycle
 // Apparently, it can be used to detect packet loss/excess latency
 uint8_t timer = 0;
-
-/*
-typedef enum {
-  RESP_USB_ACK = 0x90,
-  RESP_UPDATE_ACK = 0x91,
-  RESP_UPDATE_NACK = 0x92,
-  RESP_SYNC_START = 0xFF,
-  RESP_SYNC_1 = 0xCC,
-  RESP_SYNC_OK = 0x33,
-  RESP_CHOCO_SYNC_1 = 0xEE,
-  RESP_CHOCO_SYNC_OK = CONTROLLER_TYPE
-} Response_t;
-*/
 
 #define UART_TXD_PIN \
   (UART_PIN_NO_CHANGE)  // When UART2, TX GPIO_NUM_19, RX GPIO_NUM_26
@@ -115,9 +102,9 @@ void uart_init() {
 }
 
 static void uart_task() {
-  uint8_t stored_num = 0;
-  uint8_t stored_uart_data[11];
-  memset(stored_uart_data, 0, 11);
+  uint8_t recieved_uart_data_count = 0;
+  uint8_t recieved_uart_data[11];
+  memset(recieved_uart_data, 0, 11);
 
   while (1)
   {
@@ -128,46 +115,42 @@ static void uart_task() {
     if (len > 0) {
       for(int i=0;i<len;i++)
       {
-        if(stored_num == 11)
+        if(recieved_uart_data_count == 11)
         {
           continue;
         }
-        stored_uart_data[stored_num++] = uart_data[i];
-        if(stored_num == 11)
+        recieved_uart_data[recieved_uart_data_count++] = uart_data[i];
+        if(recieved_uart_data_count == 11)
         {
-          stored_num = 0;
+          recieved_uart_data_count = 0;
 
           // if (CONTROLLER_TYPE == PRO_CON) {
             // uart_data[0] &= ~(1 << 7);  // Clear SL
             // uart_data[0] &= ~(1 << 6);  // Clear SR
           // }
-          bool up_button = ((stored_uart_data[5] >> 3) & 1); // X
-          bool down_button = ((stored_uart_data[5] >> 1) & 1); // B
-          bool left_button = ((stored_uart_data[5] >> 0) & 1); // Y
-          bool right_button = ((stored_uart_data[5] >> 2) & 1); // A
+          uint8_t up_button = ((recieved_uart_data[5] >> 3) & 1); // X
+          uint8_t down_button = ((recieved_uart_data[5] >> 1) & 1); // B
+          uint8_t left_button = ((recieved_uart_data[5] >> 0) & 1); // Y
+          uint8_t right_button = ((recieved_uart_data[5] >> 2) & 1); // A
 
-          bool start_button = 0;
-          //    ((uart_data[0] >> 1) & 1) || ((uart_data[0] >> 0) & 1);
+          uint8_t start_button = (recieved_uart_data[6] & 0x01); // PLUS
+          uint8_t stickclick_button = (recieved_uart_data[6] & 0x02); // LStickClick
 
-          bool stickclick_button = 0;
-          //    ((uart_data[0] >> 3) & 1) || ((uart_data[0] >> 2) & 1);
+          uint8_t left_shoulder = (recieved_uart_data[5] & 0x20); // ZL
+          uint8_t right_shoulder = (recieved_uart_data[5] & 0x40); // ZR
 
-          bool left_shoulder = 0;
-          //                     ((uart_data[0] >> 6) & 1) ||
-          //                     ((uart_data[1] >> 4) & 1) ||
-          //                     ((uart_data[1] >> 6) & 1);
-          bool right_shoulder = 0;
-          //                     ((uart_data[0] >> 7) & 1) ||
-          //                     ((uart_data[1] >> 5) & 1) ||
-          //                     ((uart_data[1] >> 7) & 1);
+          uint8_t home_button = (recieved_uart_data[6] & 0x08);
+          uint8_t capture_button = (recieved_uart_data[6] & 0x10);
 
-          bool home_button = 0; // ((uart_data[0] >> 4) & 1);
-          bool capture_button = 0; // ((uart_data[0] >> 5) & 1);
+          uint8_t minus_button = (recieved_uart_data[5] & 0x80);
+          uint8_t L_button = (recieved_uart_data[5] & 0x08);
+          uint8_t R_button = (recieved_uart_data[5] & 0x10);
+          uint8_t Rstickclick_button = (recieved_uart_data[6] & 0x04);
 
           uint8_t stickX = 128;
           uint8_t stickY = 128;
-          if (stored_uart_data[7] != A_DPAD_CENTER) {
-            switch (stored_uart_data[7]) {
+          if (recieved_uart_data[7] != A_DPAD_CENTER) {
+            switch (recieved_uart_data[7]) {
               case A_DPAD_CENTER:
                 break;
               case A_DPAD_U:
@@ -198,20 +181,10 @@ static void uart_task() {
                 stickY = 0;
                 stickX = 0;
                 break;
-
               default:
                 break;
             }
           }
-          /* else {
-            if (uart_data[3] != 128 || uart_data[4] != 128) {
-              stickX = uart_data[3];
-              stickY = 255 - uart_data[4];
-            } else if (uart_data[5] != 128 || uart_data[6] != 128) {
-              stickX = uart_data[5];
-              stickY = 255 - uart_data[6];
-            }
-          }*/
 
           // Clearing button bytes.
           but1_send = 0;
@@ -224,24 +197,22 @@ static void uart_task() {
             ly_send = stickY;
             cx_send = 128;
             cy_send = 128;
-            but1_send = (left_button << 0) +     // Y
-                        (up_button << 1) +       // X
-                        (down_button << 2) +     // B
-                        (right_button << 3) +    // A
-                        (right_shoulder << 6) +  // R
-                        (right_shoulder << 7);   // ZR
+            but1_send = (left_button << 0) +    // Y
+                        (up_button << 1) +      // X
+                        (down_button << 2) +    // B
+                        (right_button << 3) +   // A
+                        (R_button << 6) +       // R
+                        (right_shoulder << 7);  // ZR
 
-            but2_send += (home_button << 4) +        // Home
+            but2_send += (home_button << 4) +         // Home
                           (start_button << 1) +       // +/Start
                           (stickclick_button << 3) +  // L Stick Click
-                          (capture_button << 5);
+                          (capture_button << 5) +     // Capture
+                          (minus_button) +            // -/Select
+                          (Rstickclick_button << 2);  // R Stick Click
 
-            but3_send = (left_shoulder << 6) +  // L
-                        (left_shoulder << 7);   // ZL
-
-            //(select_button << 0) +  // -/Select
-            //(((uart_data[0] >> 2) & 1) << 3);  // L
-            // Stick Click
+            but3_send = (L_button << 6) +      // L
+                        (left_shoulder << 7);  // ZL
           }
           if (CONTROLLER_TYPE == JOYCON_R) {
             // If this is a right joycon or a procon.
@@ -287,9 +258,9 @@ static void uart_task() {
           ESP_LOGI(
             "uart",
             "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-            stored_uart_data[0], stored_uart_data[1], stored_uart_data[2], stored_uart_data[3],
-            stored_uart_data[4], stored_uart_data[5], stored_uart_data[6], stored_uart_data[7],
-            stored_uart_data[8], stored_uart_data[9], stored_uart_data[10]);
+            recieved_uart_data[0], recieved_uart_data[1], recieved_uart_data[2], recieved_uart_data[3],
+            recieved_uart_data[4], recieved_uart_data[5], recieved_uart_data[6], recieved_uart_data[7],
+            recieved_uart_data[8], recieved_uart_data[9], recieved_uart_data[10]);
 
         }
       }
