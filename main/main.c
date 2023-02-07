@@ -97,13 +97,14 @@ void uart_init()
 
 static void uart_task()
 {
+  ESP_LOGI("uart", "Recieving uart packets on core %d\n", xPortGetCoreID());
+
   uint8_t recieved_uart_data_count = 0;
   uint8_t recieved_uart_data[11];
   memset(recieved_uart_data, 0, 11);
 
   while (1)
   {
-    ESP_LOGI("uart", "Recieving uart packets on core %d\n", xPortGetCoreID());
     int len = uart_read_bytes(UART_NUM, uart_data, BUF_SIZE, portTICK_RATE_MS);
 
     if (len > 0)
@@ -119,73 +120,124 @@ static void uart_task()
         {
           recieved_uart_data_count = 0;
 
-          // if (CONTROLLER_TYPE == PRO_CON) {
-            // uart_data[0] &= ~(1 << 7);  // Clear SL
-            // uart_data[0] &= ~(1 << 6);  // Clear SR
-          // }
-          uint8_t up_button = ((recieved_uart_data[5] >> 3) & 1); // X
-          uint8_t down_button = ((recieved_uart_data[5] >> 1) & 1); // B
-          uint8_t left_button = ((recieved_uart_data[5] >> 0) & 1); // Y
-          uint8_t right_button = ((recieved_uart_data[5] >> 2) & 1); // A
+          ESP_LOGI(
+            "uart",
+            "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            recieved_uart_data[0], recieved_uart_data[1], recieved_uart_data[2], recieved_uart_data[3],
+            recieved_uart_data[4], recieved_uart_data[5], recieved_uart_data[6], recieved_uart_data[7],
+            recieved_uart_data[8], recieved_uart_data[9], recieved_uart_data[10]);
 
-          uint8_t start_button = (recieved_uart_data[6] & 0x01); // PLUS
-          uint8_t stickclick_button = (recieved_uart_data[6] & 0x02); // LStickClick
-
-          uint8_t left_shoulder = (recieved_uart_data[5] & 0x20); // ZL
-          uint8_t right_shoulder = (recieved_uart_data[5] & 0x40); // ZR
-
-          uint8_t home_button = (recieved_uart_data[6] & 0x08);
-          uint8_t capture_button = (recieved_uart_data[6] & 0x10);
-
-          uint8_t minus_button = (recieved_uart_data[5] & 0x80);
-          uint8_t L_button = (recieved_uart_data[5] & 0x08);
-          uint8_t R_button = (recieved_uart_data[5] & 0x10);
-          uint8_t Rstickclick_button = (recieved_uart_data[6] & 0x04);
-
-          uint8_t stickX = 128;
-          uint8_t stickY = 128;
-          if (recieved_uart_data[7] != A_DPAD_CENTER) {
-            switch (recieved_uart_data[7]) {
-              case A_DPAD_CENTER:
-                break;
-              case A_DPAD_U:
-                stickY = 255;
-                break;
-              case A_DPAD_R:
-                stickX = 255;
-                break;
-              case A_DPAD_D:
-                stickY = 0;
-                break;
-              case A_DPAD_L:
-                stickX = 0;
-                break;
-              case A_DPAD_U_R:
-                stickY = 255;
-                stickX = 255;
-                break;
-              case A_DPAD_U_L:
-                stickY = 255;
-                stickX = 0;
-                break;
-              case A_DPAD_D_R:
-                stickY = 0;
-                stickX = 255;
-                break;
-              case A_DPAD_D_L:
-                stickY = 0;
-                stickX = 0;
-                break;
-              default:
-                break;
-            }
+          // 受信したデータの正当性を確認する
+          if((recieved_uart_data[0] != 0xAA) || (recieved_uart_data[1] != 0xAA) ||
+             (recieved_uart_data[2] != 0xAA) || (recieved_uart_data[3] != 0xAA) ||
+             (recieved_uart_data[4] != 0xAA) || (recieved_uart_data[10] != 0x00))
+          {
+            // 受信したデータの形が不正だったとき
+            uart_flush(UART_NUM);
+            memset(recieved_uart_data, 0, 11);
           }
+          else
+          {
+            // if (CONTROLLER_TYPE == PRO_CON) {
+              // uart_data[0] &= ~(1 << 7);  // Clear SL
+              // uart_data[0] &= ~(1 << 6);  // Clear SR
+            // }
+            uint8_t up_button = ((recieved_uart_data[5] >> 3) & 1); // X
+            uint8_t down_button = ((recieved_uart_data[5] >> 1) & 1); // B
+            uint8_t left_button = ((recieved_uart_data[5] >> 0) & 1); // Y
+            uint8_t right_button = ((recieved_uart_data[5] >> 2) & 1); // A
 
-          // Clearing button bytes.
-          but1_send = 0;
-          but2_send = 0;
-          but3_send = 0;
-          if (CONTROLLER_TYPE == PRO_CON) {
+            uint8_t start_button = (recieved_uart_data[6] & 0x01); // PLUS
+            uint8_t stickclick_button = (recieved_uart_data[6] & 0x02); // LStickClick
+
+            uint8_t left_shoulder = (recieved_uart_data[5] & 0x20); // ZL
+            uint8_t right_shoulder = (recieved_uart_data[5] & 0x40); // ZR
+
+            uint8_t home_button = (recieved_uart_data[6] & 0x08);
+            uint8_t capture_button = (recieved_uart_data[6] & 0x10);
+
+            uint8_t minus_button = (recieved_uart_data[5] & 0x80);
+            uint8_t L_button = (recieved_uart_data[5] & 0x08);
+            uint8_t R_button = (recieved_uart_data[5] & 0x10);
+            uint8_t Rstickclick_button = (recieved_uart_data[6] & 0x04);
+
+            uint8_t stickX = 128;
+            uint8_t stickY = 128;
+
+            uint8_t d_up = 0;
+            uint8_t d_down = 0;
+            uint8_t d_left = 0;
+            uint8_t d_right = 0;
+            if (recieved_uart_data[7] != A_DPAD_CENTER) {
+              switch (recieved_uart_data[7]) {
+                case A_DPAD_CENTER:
+                  break;
+                case A_DPAD_U:
+                  d_up = 1;
+                  // stickY = 255;
+                  break;
+                case A_DPAD_R:
+                  d_right = 1;
+                  // stickX = 255;
+                  break;
+                case A_DPAD_D:
+                  d_down = 1;
+                  // stickY = 0;
+                  break;
+                case A_DPAD_L:
+                  d_left = 1;
+                  // stickX = 0;
+                  break;
+                case A_DPAD_U_R:
+                  d_up = 1;
+                  d_right = 1;
+                  // stickY = 255;
+                  // stickX = 255;
+                  break;
+                case A_DPAD_U_L:
+                  d_up = 1;
+                  d_left = 1;
+                  // stickY = 255;
+                  // stickX = 0;
+                  break;
+                case A_DPAD_D_R:
+                  d_right = 1;
+                  d_down = 1;
+                  // stickY = 0;
+                  // stickX = 255;
+                  break;
+                case A_DPAD_D_L:
+                  d_left = 1;
+                  d_down = 1;
+                  // stickY = 0;
+                  // stickX = 0;
+                  break;
+                default:
+                  break;
+              }
+            }
+
+            // recieved_uart_data[8] // left analog
+            // recieved_uart_data[9] // right analog
+            /*
+            0x00	センター
+            0x01	左
+            0x02	右
+            0x03	
+            0x04	上
+            0x05	左上
+            0x06	右上
+            0x07	
+            0x08	下
+            0x09	左下
+            0x0A	右下
+            */
+
+            // Clearing button bytes.
+            but1_send = 0;
+            but2_send = 0;
+            but3_send = 0;
+            
             // uart_data[0] &= ~(1 << 7);  // Clear SL
             // uart_data[0] &= ~(1 << 6);  // Clear SR
             lx_send = stickX;
@@ -207,54 +259,14 @@ static void uart_task()
                           (Rstickclick_button << 2);  // R Stick Click
 
             but3_send = (L_button << 6) +      // L
-                        (left_shoulder << 7);  // ZL
+                        (left_shoulder << 7) + // ZL
+                        (d_down) +
+                        (d_up << 1) +
+                        (d_right << 2) +
+                        (d_left << 3);
+                        //          0     1   2     3     4   5   6 7
+                        // 5 (Left)	Down	Up	Right	Left	SR	SL	L	ZL
           }
-          if (CONTROLLER_TYPE == JOYCON_R) {
-            // If this is a right joycon or a procon.
-
-            lx_send = 128;
-            ly_send = 128;
-            cx_send = 255 - stickY;
-            cy_send = stickX;
-
-            but1_send = (up_button << 0) +       // Y
-                        (right_button << 1) +    // X
-                        (left_button << 2) +     // B
-                        (down_button << 3) +     // A
-                        (right_shoulder << 4) +  // SR
-                        (left_shoulder << 5);    // SL
-
-            but2_send += (home_button << 4) +       // Home
-                          (start_button << 1) +      // +/Start
-                          (stickclick_button << 2);  // R Stick Click
-          }
-
-          if (CONTROLLER_TYPE == JOYCON_L) {
-            // If this is a left joycon or a procon.
-
-            lx_send = stickY;
-            ly_send = 255 - stickX;
-            cx_send = 128;
-            cy_send = 128;
-
-            but3_send = (right_button << 0) +    // Y
-                        (left_button << 1) +     // X
-                        (up_button << 2) +       // B
-                        (down_button << 3) +     // A
-                        (right_shoulder << 4) +  // SR
-                        (left_shoulder << 5);    // SL
-
-            but2_send += (start_button << 0) +       // -/Select
-                          (stickclick_button << 3) +  // L Stick Click
-                          (capture_button << 5);      // Capture
-          }
-
-          ESP_LOGI(
-            "uart",
-            "Packet data: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-            recieved_uart_data[0], recieved_uart_data[1], recieved_uart_data[2], recieved_uart_data[3],
-            recieved_uart_data[4], recieved_uart_data[5], recieved_uart_data[6], recieved_uart_data[7],
-            recieved_uart_data[8], recieved_uart_data[9], recieved_uart_data[10]);
         }
       }
 
@@ -272,7 +284,6 @@ static void uart_task()
       }
     }
   }
-
   vTaskDelete(NULL);
 }
 
@@ -471,19 +482,6 @@ static uint8_t reply3001[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-#if CONTROLLER_TYPE == JOYCON_L
-// If I had to guess, the Pro Controller equivalent for SET_NFC_IR_MCU_STATE
-// Joycontrol calls it SET_NFC_IR_MCU_CONFIG, so maybe its setting the IR sensor
-// to OFF?
-static uint8_t reply3333[] = {
-  0x03, 0x8E, 0x84, 0x00, 0x12, 0x01, 0x18, 0x80,
-  0x01, 0x18, 0x80, 0x80, 0x80, 0x21, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-#elif CONTROLLER_TYPE == JOYCON_R
 static uint8_t reply3333[] = {
   0x31, 0x8e, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80,
   0x00, 0x08, 0x80, 0x00, 0xa0, 0x21, 0x01, 0x00,
@@ -493,17 +491,6 @@ static uint8_t reply3333[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b,
   0x00
 };
-#else
-static uint8_t reply3333[] = {
-  0x31, 0x8e, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80,
-  0x00, 0x08, 0x80, 0x00, 0xa0, 0x21, 0x01, 0x00,
-  0x00, 0x00, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b,
-  0x00
-};
-#endif
 
 // Reply for SubCommand.SET_NFC_IR_MCU_STATE
 static uint8_t reply3401[] = {
@@ -792,7 +779,7 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
     }
     break;
   case ESP_HIDD_INTR_DATA_EVT:
-    ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
+    ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT id:0x%02x", param->intr_data.report_id);
     esp_log_buffer_hex(TAG, param->intr_data.data, param->intr_data.len);
     if (param->intr_data.data[9] == 2)
     {
@@ -867,10 +854,10 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
     {
       esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3001), reply3001);
       ESP_LOGI(TAG, "reply3001");
-      if (CONTROLLER_TYPE == JOYCON_L)
-      {
-        paired = true;
-      }
+      // if (CONTROLLER_TYPE == JOYCON_L)
+      // {
+      //   paired = true;
+      // }
     }
     if (param->intr_data.data[9] == 33 && param->intr_data.data[10] == 33)
     {
@@ -997,19 +984,7 @@ void app_main()
   }
 
   ESP_LOGI(TAG, "setting device name");
-
-  if (CONTROLLER_TYPE == JOYCON_L)
-  {
-    esp_bt_dev_set_device_name("Joy-Con (L)");
-  }
-  else if (CONTROLLER_TYPE == JOYCON_R)
-  {
-    esp_bt_dev_set_device_name("Joy-Con (R)");
-  }
-  else
-  {
-    esp_bt_dev_set_device_name("Pro Controller");
-  }
+  esp_bt_dev_set_device_name("Pro Controller");
 
   ESP_LOGI(TAG, "setting hid device class");
   esp_bt_gap_set_cod(dclass, ESP_BT_SET_COD_ALL);
