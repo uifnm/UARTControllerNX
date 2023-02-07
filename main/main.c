@@ -29,12 +29,48 @@
 #define PIN_SEL (1ULL << LED_GPIO)
 
 #define PRO_CON 0x03
-#define JOYCON_L 0x01
-#define JOYCON_R 0x02
+// #define JOYCON_L 0x01
+// #define JOYCON_R 0x02
 
 #define CONTROLLER_TYPE PRO_CON
 
-// Buttons and sticks
+typedef struct 
+{
+    // Buttons
+    uint8_t A;
+    uint8_t B;
+    uint8_t X;
+    uint8_t Y;
+
+    // Triggers
+    uint8_t L;
+    uint8_t R;
+    uint8_t ZL;
+    uint8_t ZR;
+
+    // Dpad
+    uint8_t Dpad_Up;
+    uint8_t Dpad_Down;
+    uint8_t Dpad_Left;
+    uint8_t Dpad_Right;
+
+    // Functions
+    uint8_t Plus;
+    uint8_t Minus;
+    uint8_t Capture;
+    uint8_t Home;
+
+    // Sticks
+    uint8_t StickL_X;
+    uint8_t StickL_Y;
+    uint8_t StickL_Click;
+    uint8_t StickR_X;
+    uint8_t StickR_Y;
+    uint8_t StickR_Click;
+
+} ControlInputStatus;
+
+// Dpad input defines
 #define A_DPAD_CENTER 0x08
 #define A_DPAD_U 0x00
 #define A_DPAD_U_R 0x01
@@ -52,13 +88,13 @@ static uint8_t but3_send = 0; // (Left) D, U, R, L, SR, SL, L, ZL
 
 static uint8_t lx_send = 128;
 static uint8_t ly_send = 128;
-static uint8_t cx_send = 128;
-static uint8_t cy_send = 128;
-
-SemaphoreHandle_t xSemaphore;
+static uint8_t rx_send = 128;
+static uint8_t ry_send = 128;
 
 bool connected = false;
 bool paired = false;
+
+SemaphoreHandle_t xSemaphore;
 
 TaskHandle_t ButtonsHandle = NULL;
 TaskHandle_t SendingHandle = NULL;
@@ -69,7 +105,10 @@ static esp_hidd_qos_param_t both_qos;
 
 // Timer has +1 added to it every send cycle
 // Apparently, it can be used to detect packet loss/excess latency
-uint8_t timer = 0;
+static uint8_t timer = 0;
+
+static uint8_t report30[48] = {[0] = 0x00, [1] = 0x8E, [11] = 0x80};
+static uint8_t dummy[11] = {0x00, 0x8E, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x08, 0x80};
 
 #define UART_NUM (UART_NUM_0)
 #define UART_TXD_PIN (UART_PIN_NO_CHANGE) // When UART2, TX GPIO_NUM_19, RX GPIO_NUM_26
@@ -107,15 +146,14 @@ static void uart_task()
   {
     int len = uart_read_bytes(UART_NUM, uart_data, BUF_SIZE, portTICK_RATE_MS);
 
+    // 受信データがある
     if (len > 0)
     {
       for(int i=0;i<len;i++)
       {
-        // if(recieved_uart_data_count == 11)
-        // {
-        //   continue;
-        // }
         recieved_uart_data[recieved_uart_data_count++] = uart_data[i];
+
+        // 1フレーム分11バイト受信した
         if(recieved_uart_data_count == 11)
         {
           recieved_uart_data_count = 0;
@@ -132,140 +170,144 @@ static void uart_task()
              (recieved_uart_data[2] != 0xAA) || (recieved_uart_data[3] != 0xAA) ||
              (recieved_uart_data[4] != 0xAA) || (recieved_uart_data[10] != 0x00))
           {
-            // 受信したデータの形が不正だったとき
+            // 受信したデータの形が不正だった
             uart_flush(UART_NUM);
             memset(recieved_uart_data, 0, 11);
           }
-          else
+          else // 受信したデータの形が正常だった
           {
-            // if (CONTROLLER_TYPE == PRO_CON) {
-              // uart_data[0] &= ~(1 << 7);  // Clear SL
-              // uart_data[0] &= ~(1 << 6);  // Clear SR
-            // }
-            uint8_t up_button = ((recieved_uart_data[5] >> 3) & 1); // X
-            uint8_t down_button = ((recieved_uart_data[5] >> 1) & 1); // B
-            uint8_t left_button = ((recieved_uart_data[5] >> 0) & 1); // Y
-            uint8_t right_button = ((recieved_uart_data[5] >> 2) & 1); // A
+            // 入力情報をまとめる
+            ControlInputStatus inputStatus;
 
-            uint8_t start_button = (recieved_uart_data[6] & 0x01); // PLUS
-            uint8_t stickclick_button = (recieved_uart_data[6] & 0x02); // LStickClick
+            inputStatus.ZR = ((recieved_uart_data[5] >> 7) & 1); // ZR
+            inputStatus.ZL = ((recieved_uart_data[5] >> 6) & 1); // ZL
+            inputStatus.R = ((recieved_uart_data[5] >> 5) & 1); // R
+            inputStatus.L = ((recieved_uart_data[5] >> 4) & 1); // L
+            inputStatus.X = ((recieved_uart_data[5] >> 3) & 1); // X
+            inputStatus.A = ((recieved_uart_data[5] >> 2) & 1); // A
+            inputStatus.B = ((recieved_uart_data[5] >> 1) & 1); // B
+            inputStatus.Y = (recieved_uart_data[5] & 1); // Y
 
-            uint8_t left_shoulder = (recieved_uart_data[5] & 0x20); // ZL
-            uint8_t right_shoulder = (recieved_uart_data[5] & 0x40); // ZR
+            inputStatus.Capture = ((recieved_uart_data[6] >> 5) & 1); // Capture
+            inputStatus.Home = ((recieved_uart_data[6] >> 4) & 1); // Home
+            inputStatus.StickR_Click = ((recieved_uart_data[6] >> 3) & 1); // StickR_Click
+            inputStatus.StickL_Click = ((recieved_uart_data[6] >> 2) & 1); // StickL_Click            
+            inputStatus.Plus = ((recieved_uart_data[6] >> 1) & 1); // Plus
+            inputStatus.Minus = (recieved_uart_data[6] & 1); // Minus
 
-            uint8_t home_button = (recieved_uart_data[6] & 0x08);
-            uint8_t capture_button = (recieved_uart_data[6] & 0x10);
+            // Dpad initialize
+            inputStatus.Dpad_Up = 0;
+            inputStatus.Dpad_Down = 0;
+            inputStatus.Dpad_Left = 0;
+            inputStatus.Dpad_Right = 0;
 
-            uint8_t minus_button = (recieved_uart_data[5] & 0x80);
-            uint8_t L_button = (recieved_uart_data[5] & 0x08);
-            uint8_t R_button = (recieved_uart_data[5] & 0x10);
-            uint8_t Rstickclick_button = (recieved_uart_data[6] & 0x04);
-
-            uint8_t stickX = 128;
-            uint8_t stickY = 128;
-
-            uint8_t d_up = 0;
-            uint8_t d_down = 0;
-            uint8_t d_left = 0;
-            uint8_t d_right = 0;
-            if (recieved_uart_data[7] != A_DPAD_CENTER) {
-              switch (recieved_uart_data[7]) {
-                case A_DPAD_CENTER:
-                  break;
-                case A_DPAD_U:
-                  d_up = 1;
-                  // stickY = 255;
-                  break;
-                case A_DPAD_R:
-                  d_right = 1;
-                  // stickX = 255;
-                  break;
-                case A_DPAD_D:
-                  d_down = 1;
-                  // stickY = 0;
-                  break;
-                case A_DPAD_L:
-                  d_left = 1;
-                  // stickX = 0;
-                  break;
-                case A_DPAD_U_R:
-                  d_up = 1;
-                  d_right = 1;
-                  // stickY = 255;
-                  // stickX = 255;
-                  break;
-                case A_DPAD_U_L:
-                  d_up = 1;
-                  d_left = 1;
-                  // stickY = 255;
-                  // stickX = 0;
-                  break;
-                case A_DPAD_D_R:
-                  d_right = 1;
-                  d_down = 1;
-                  // stickY = 0;
-                  // stickX = 255;
-                  break;
-                case A_DPAD_D_L:
-                  d_left = 1;
-                  d_down = 1;
-                  // stickY = 0;
-                  // stickX = 0;
-                  break;
-                default:
-                  break;
-              }
+            switch(recieved_uart_data[7])
+            {
+              case A_DPAD_U:
+                inputStatus.Dpad_Up = 1;
+                break;
+              case A_DPAD_R:
+                inputStatus.Dpad_Right = 1;
+                break;
+              case A_DPAD_D:
+                inputStatus.Dpad_Down = 1;
+                break;
+              case A_DPAD_L:
+                inputStatus.Dpad_Left = 1;
+                break;
+              case A_DPAD_U_R:
+                inputStatus.Dpad_Up = 1;
+                inputStatus.Dpad_Right = 1;
+                break;
+              case A_DPAD_U_L:
+                inputStatus.Dpad_Up = 1;
+                inputStatus.Dpad_Left = 1;
+                break;
+              case A_DPAD_D_R:
+                inputStatus.Dpad_Down = 1;
+                inputStatus.Dpad_Right = 1;
+                break;
+              case A_DPAD_D_L:
+                inputStatus.Dpad_Down = 1;
+                inputStatus.Dpad_Left = 1;
+                break;
+              case A_DPAD_CENTER:
+              default:
+                break;
             }
 
-            // recieved_uart_data[8] // left analog
-            // recieved_uart_data[9] // right analog
-            /*
-            0x00	センター
-            0x01	左
-            0x02	右
-            0x03	
-            0x04	上
-            0x05	左上
-            0x06	右上
-            0x07	
-            0x08	下
-            0x09	左下
-            0x0A	右下
-            */
+            // Stick initialize
+            inputStatus.StickL_X = 128;
+            inputStatus.StickL_Y = 128;
+            inputStatus.StickR_X = 128;
+            inputStatus.StickR_Y = 128;
 
-            // Clearing button bytes.
-            but1_send = 0;
-            but2_send = 0;
-            but3_send = 0;
-            
-            // uart_data[0] &= ~(1 << 7);  // Clear SL
-            // uart_data[0] &= ~(1 << 6);  // Clear SR
-            lx_send = stickX;
-            ly_send = stickY;
-            cx_send = 128;
-            cy_send = 128;
-            but1_send = (left_button << 0) +    // Y
-                        (up_button << 1) +      // X
-                        (down_button << 2) +    // B
-                        (right_button << 3) +   // A
-                        (R_button << 6) +       // R
-                        (right_shoulder << 7);  // ZR
+            // StickL_X
+            if(recieved_uart_data[8] & 0x01) // Left
+            {
+              inputStatus.StickL_X = 0;
+            }
+            else if(recieved_uart_data[8]  & 0x02) // Right
+            {
+              inputStatus.StickL_X = 255;
+            }
 
-            but2_send += (home_button << 4) +         // Home
-                          (start_button << 1) +       // +/Start
-                          (stickclick_button << 3) +  // L Stick Click
-                          (capture_button << 5) +     // Capture
-                          (minus_button) +            // -/Select
-                          (Rstickclick_button << 2);  // R Stick Click
+            // StickL_Y
+            if(recieved_uart_data[8] & 0x04) // Up
+            {
+              inputStatus.StickL_Y = 255;
+            }
+            else if(recieved_uart_data[8] & 0x08) // Down
+            {
+              inputStatus.StickL_Y = 0;
+            }
 
-            but3_send = (L_button << 6) +      // L
-                        (left_shoulder << 7) + // ZL
-                        (d_down) +
-                        (d_up << 1) +
-                        (d_right << 2) +
-                        (d_left << 3);
-                        //          0     1   2     3     4   5   6 7
-                        // 5 (Left)	Down	Up	Right	Left	SR	SL	L	ZL
+            // StickR_X
+            if(recieved_uart_data[9] & 0x01) // Left
+            {
+              inputStatus.StickR_X = 0;
+            }
+            else if(recieved_uart_data[9]  & 0x02) // Right
+            {
+              inputStatus.StickR_X = 255;
+            }
+
+            // StickR_Y
+            if(recieved_uart_data[9] & 0x04) // Up
+            {
+              inputStatus.StickR_Y = 255;
+            }
+            else if(recieved_uart_data[9] & 0x08) // Down
+            {
+              inputStatus.StickR_Y = 0;
+            }
+
+            // まとめた入力情報を送信用データにセットする
+            but1_send = (inputStatus.Y) +       // Y
+                        (inputStatus.X << 1) +  // X
+                        (inputStatus.B << 2) +  // B
+                        (inputStatus.A << 3) +  // A
+                        (inputStatus.R << 6) +  // R
+                        (inputStatus.ZR << 7);  // ZR
+
+            but2_send = (inputStatus.Minus) +     // Minus/Select
+                        (inputStatus.Plus << 1) + // Plus/Start
+                        (inputStatus.StickR_Click << 2) + // R Stick Click
+                        (inputStatus.StickL_Click << 3) + // L Stick Click
+                        (inputStatus.Home << 4) +   // Home
+                        (inputStatus.Capture << 5); // Capture      
+
+            but3_send = (inputStatus.Dpad_Down) +       // Dpad_Down
+                        (inputStatus.Dpad_Up << 1) +    // Dpad_Up
+                        (inputStatus.Dpad_Right << 2) + // Dpad_Right
+                        (inputStatus.Dpad_Left << 3) +  // Dpad_Left
+                        (inputStatus.L << 6) + // L
+                        (inputStatus.ZL << 7); // ZL
+
+            lx_send = inputStatus.StickL_X;
+            ly_send = inputStatus.StickL_Y;
+            rx_send = inputStatus.StickR_X;
+            ry_send = inputStatus.StickR_Y;
           }
         }
       }
@@ -275,28 +317,18 @@ static void uart_task()
         ESP_LOGI("uart", "but1: %d, but2: %d, but3: %d\n", but1_send, but2_send, but3_send);
       }
 
-      if ((lx_send != 128 && lx_send != 127) ||
-          (ly_send != 128 && ly_send != 127) ||
-          (cx_send != 128 && cx_send != 127) ||
-          (cy_send != 128 && cy_send != 127))
+      if ((lx_send != 128) || (ly_send != 128) ||
+          (rx_send != 128) || (ry_send != 128))
       {
-        ESP_LOGI("uart", "lx: %d, ly: %d, cx: %d, cy: %d\n", lx_send, ly_send, cx_send, cy_send);
+        ESP_LOGI("uart", "lx: %d, ly: %d, cx: %d, cy: %d\n", lx_send, ly_send, rx_send, ry_send);
       }
     }
   }
   vTaskDelete(NULL);
 }
 
-// Switch button report example //         batlvl       Buttons Lstick Rstick
-// static uint8_t report30[] = {0x30, 0x00, 0x90,   0x00, 0x00, 0x00,   0x00,
-// 0x00, 0x00,   0x00, 0x00, 0x00};
-// 80
-static uint8_t report30[48] = {[0] = 0x00, [1] = 0x8E, [11] = 0x80};
-
-static uint8_t dummy[11] = {0x00, 0x8E, 0x00, 0x00, 0x00,
-                            0x00, 0x08, 0x80, 0x00, 0x08, 0x80};
-
-void send_buttons() {
+void send_buttons()
+{
   xSemaphoreTake(xSemaphore, portMAX_DELAY);
   report30[0] = timer;
   dummy[0] = timer;
@@ -309,12 +341,19 @@ void send_buttons() {
   report30[6] = (lx_send & 0xF0) >> 4;
   report30[7] = ly_send;
   // encode right stick
-  report30[8] = (cx_send << 4) & 0xF0;
-  report30[9] = (cx_send & 0xF0) >> 4;
-  report30[10] = cy_send;
+  report30[8] = (rx_send << 4) & 0xF0;
+  report30[9] = (rx_send & 0xF0) >> 4;
+  report30[10] = ry_send;
   xSemaphoreGive(xSemaphore);
-  timer += 1;
-  if (timer == 255) timer = 0;
+
+  if(timer == 255)
+  {
+    timer = 0;
+  }
+  else
+  {
+    timer += 1;
+  }
 
   if (paired || connected)
   {
@@ -336,13 +375,7 @@ static uint8_t reply02[] = {
   0x00, 0x00, 0x00, 0x00, 0x82, 0x02, 0x04, 0x00,
   CONTROLLER_TYPE,
         0x02, 0xD4, 0xF0, 0x57, 0x6E, 0xF0, 0xD7,
-  0x01,
-#if CONTROLLER_TYPE == PRO_CON
-        0x02,
-#else
-        0x01,
-#endif
-              0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -396,12 +429,8 @@ static uint8_t spi_reply_address_0x50[] = {
   0x00, 0x00, 0x90, 0x10, 0x50, 0x60, 0x00, 0x00, 0x0D, // Start of colors
   0x23, 0x23, 0x23,                                     // Body color
   0xff, 0xff, 0xff,                                     // Buttons color
-#if CONTROLLER_TYPE == PRO_CON
   0x95, 0x15, 0x15, // Left Grip color (Pro Con)
   0x15, 0x15, 0x95, // Right Grip color (Pro Con)
-#else
-  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-#endif
   0xff,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -561,6 +590,7 @@ void startBlink()
   vTaskDelete(NULL);
 }
 
+/*
 void set_bt_address()
 {
   // store a random MAC address in flash
@@ -593,9 +623,11 @@ void set_bt_address()
   nvs_close(my_handle);
   esp_base_mac_addr_set(bt_addr);
 
-  //put mac addr in switch pairing packet
+  // put mac addr in switch pairing packet
   for(int z=0;z<6;z++)
+  {
     reply02[z+19] = bt_addr[z];
+  }
 }
 
 void print_bt_address()
@@ -607,6 +639,7 @@ void print_bt_address()
   ESP_LOGI(TAG, "bluetooth address is %02X:%02X:%02X:%02X:%02X:%02X",
     bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5]);
 }
+*/
 
 static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {

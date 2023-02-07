@@ -21,7 +21,9 @@
         "condition_variable": "c",
         "portmacro.h": "c",
         "freertos.h": "c",
-        "esp_bt_device.h": "c"
+        "esp_bt_device.h": "c",
+        "uart.h": "c",
+        "esp_gap_bt_api.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled",
     "idf.adapterTargetName": "esp32",
