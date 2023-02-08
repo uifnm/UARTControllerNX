@@ -1,4 +1,4 @@
-# UARTSwitchCon (Modified)
+# UARTControllerNX
 シリアル接続で制御可能なNintendo Switch用コントローラをESP32でエミュレートします。
 
 ESP32はBluetooth接続によってPro Controllerとして振る舞い、Nintendo Switchに対して各ボタンやスティック入力の機能を提供します。  
