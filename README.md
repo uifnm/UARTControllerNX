@@ -78,6 +78,9 @@ Byte0-4と10は固定で、入力状態による変化はありません。
 | 0x01 | 0x00 | 0x02 |
 | 0x09 | 0x08 | 0x0A |
 
+# おわりに
+
+このプログラムの使用について、NX Macro Controllerの作者であるぼんじりさんや、他のソフトウェア・ツール・ユーティリティの作者様に問い合わせることは固くご遠慮ください。
 
 # Thanks
 
@@ -86,7 +89,3 @@ Byte0-4と10は固定で、入力状態による変化はありません。
 - [NathanReeves/BlueCubeMod](https://github.com/NathanReeves/BlueCubeMod).
 - [wchill/SwitchInputEmulator](https://github.com/wchill/SwitchInputEmulator).
 - [nullstalgia/UARTSwitchCon](https://github.com/nullstalgia/UARTSwitchCon), and v12 Switch Firmware support [mizuyoukan-ao](https://github.com/mizuyoukanao).
-
-# おわりに
-
-このプログラムの使用について、NX Macro Controllerの作者であるぼんじりさんや、他のソフトウェア・ツール・ユーティリティの製作者様に問い合わせることは固くご遠慮ください。
